@@ -4,18 +4,24 @@ import json
 import random
 import time
 from typing import List, Optional, Tuple
+from dataclasses import dataclass
+import numpy as np
 
 import torch
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           PreTrainedTokenizerBase)
 from tqdm import tqdm
 
+@dataclass
+class SessionMD:
+    sid : int # idx in the dataset trace, identify a trace of interactive conversations
 
 def sample_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int],
+    filter_dataset: bool,
 ) -> List[Tuple[str, int, int]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -23,6 +29,7 @@ def sample_requests(
     # Load the dataset.
     with open(dataset_path) as f:
         dataset = json.load(f)
+    """ old code
     # Filter out the conversations with less than 2 turns.
     dataset = [data for data in dataset if len(data["conversations"]) >= 2]
     # Only keep the first two turns of each conversation.
@@ -42,19 +49,67 @@ def sample_requests(
         tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
 
     # Filter out too long sequences.
-    filtered_dataset: List[Tuple[str, int, int]] = []
-    for prompt, prompt_token_ids, output_len in tokenized_dataset:
-        prompt_len = len(prompt_token_ids)
-        if prompt_len < 4 or output_len < 4:
-            # Prune too short sequences.
-            continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
-            # Prune too long sequences.
-            continue
-        filtered_dataset.append((prompt, prompt_len, output_len))
+    if filter_dataset:
+        filtered_dataset: List[Tuple[str, int, int]] = []
+        for prompt, prompt_token_ids, output_len in tokenized_dataset:
+            prompt_len = len(prompt_token_ids)
+            if prompt_len < 4 or output_len < 4:
+                # Prune too short sequences.
+                continue
+            if prompt_len > 1024 or prompt_len + output_len > 2048:
+                # Prune too long sequences.
+                continue
+            filtered_dataset.append((prompt, prompt_len, output_len))
 
-    # Sample the requests.
-    sampled_requests = random.sample(filtered_dataset, num_requests)
+        # Sample the requests.
+        sampled_requests = random.sample(filtered_dataset, num_requests)
+    else:
+        sampled_requests = random.sample(tokenized_dataset, num_requests)
+    """
+    sessionMDs = []
+    for sid, session in enumerate(dataset):
+        convs = session["converstaions"]
+        if len(convs) < 2:
+            continue
+        min_prompt_len = len(tokenizer(convs[0]["value"]).input_ids)
+        min_output_len = len(tokenizer(convs[1]["value"]).input_ids)
+        if (not filter_dataset) or (min_prompt_len >= 4 and min_output_len >= 4):
+            sessionMDs.append(SessionMD(sid))
+    print(f"From the dataset, we consider total of {len(sessionMDs)} conversation sessions in the trace.")
+    sampled_sessionMDs = random.sample(sessionMDs, num_requests)
+    
+    # workqueue entry (sid, cid, acc_prompt_ntks)
+    # sid: the idx of the session in the trace
+    # cid: the idx of the next conversation in the session to be asked. should be 2*i (i=0,1,2,...)
+    # acc_prompt_ntks: the accmulated number of tokens of the prompt in conversation [0,...,cid-1]
+    workqueue = [(s.sid, 0, 0) for s in sampled_sessionMDs]
+    # sampled requests entry: (prompt, prompted_len, output_len)
+    sampled_requests = []
+
+    request_stat = {"TotalSessions" : 0, "ConvsPerSession" : {}, "TotalPromptTokens" : 0, "TotalOutputTokens" : 0}
+    while len(workqueue) > 0:
+        sid, cid, acc_prompt_ntks = workqueue.pop(0)
+        convs = dataset[sid]["conversations"]
+        Qconv = convs[cid]
+        Aconv = convs[cid + 1]
+        assert(Qconv["from"] == "human" and Aconv["from"] == "gpt")
+        next_prompt = str.join([conv["value"] for conv in convs[:cid + 1]])
+        next_prompt_ntks = acc_prompt_ntks + len(tokenizer(Qconv["value"]).input_ids)
+        next_completion_ntks = len(tokenizer(Aconv["value"]).input_ids)
+        if filter_dataset and (next_prompt_ntks > 1024 or next_prompt_ntks + next_completion_ntks > 2048):
+            continue
+        request_stat["TotalSessions"] += 1
+        request_stat["TotalPromptTokens"] += next_prompt_ntks
+        request_stat["TotalOutputTokens"] += next_completion_ntks
+        request_stat["ConvsPerSession"][sid] = request_stat["ConvsPerSession"].get(sid, 0) + 1
+        sampled_requests.append((next_prompt, len(next_prompt), next_completion_ntks))
+        if cid + 2 < len(convs):
+            workqueue.append((sid, cid + 2, next_prompt_ntks + next_completion_ntks))
+    # show the min, max, avg of the sampled requests prompt_len, output_len and sum of both
+    stat_ops = [np.mean, np.min, np.max]
+    N = len(sampled_requests)
+    print(f"Sampled requests stats: {N} requests from {request_stat["TotalSessions"]} sessions, convs/session (min/max/avg): {'/'.join([str(op(request_stat["ConvsPerSession"].values())) for op in stat_ops])}")
+    print(f"avg prompt_tks ({request_stat["TotalPromptTokens"] / N}), avg output_tks ({request_stat["TotalOutputTokens"] / N})")
     return sampled_requests
 
 
@@ -203,7 +258,7 @@ def main(args: argparse.Namespace):
                     for _ in range(args.num_prompts)]
     else:
         requests = sample_requests(args.dataset, args.num_prompts, tokenizer,
-                                   args.output_len)
+                                   args.output_len, args.filter_dataset)
 
     if args.backend == "vllm":
         elapsed_time = run_vllm(requests, args.model, args.tokenizer,
@@ -263,6 +318,7 @@ if __name__ == "__main__":
                         type=int,
                         default=1000,
                         help="Number of prompts to process.")
+    parser.add_argument("--no-filter-dataset", dest="filter_dataset", action="store_false", help="Disable the vLLM default behavior of filtering out too short and too long sequences from the dataset.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--hf-max-batch-size",
                         type=int,
