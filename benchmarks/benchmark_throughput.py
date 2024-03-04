@@ -16,6 +16,37 @@ from tqdm import tqdm
 class SessionMD:
     sid : int # idx in the dataset trace, identify a trace of interactive conversations
 
+class RequestStat:
+    def __init__(self):
+        self.session_set = set()
+        # sid -> conversation counter
+        self.convs_per_session = {}
+        self.prompt_ntks = []
+        self.output_ntks = []
+
+    def TraceReq(self, sid, prompt_ntks, output_ntks):
+        self.session_set.add(sid)
+        self.prompt_ntks.append(prompt_ntks)
+        self.output_ntks.append(output_ntks)
+        self.convs_per_session[sid] = self.convs_per_session.get(sid, 0) + 1
+
+    def TotalRequests(self) -> int:
+        return sum(self.convs_per_session.values())
+
+    def AssertTotal(self, N: int):
+        assert(N == self.TotalRequests())
+
+    def getMinMaxAvgStr(self, l) -> str:
+        return f"{np.min(l)}/{np.max(l)}/{np.mean(l):0.2f}"
+
+    def Print(self):
+        stat_ops = [np.min, np.max, np.mean]
+        N = self.TotalRequests()
+        print(f"Sampled requests stats: {N} requests from {len(self.session_set)} sessions.")
+        print(f"convs/session (min/max/avg): {self.getMinMaxAvgStr(list(self.convs_per_session.values()))}")
+        print(f"prompt_tks ({self.getMinMaxAvgStr(self.prompt_ntks)})")
+        print(f"avg output_tks ({self.getMinMaxAvgStr(self.output_ntks)})")
+
 def sample_requests(
     dataset_path: str,
     num_requests: int,
@@ -66,14 +97,27 @@ def sample_requests(
     else:
         sampled_requests = random.sample(tokenized_dataset, num_requests)
     """
-    sessionMDs = []
+    sids = []
+    first_prompts = []
+    first_outputs = []
     for sid, session in enumerate(dataset):
-        convs = session["converstaions"]
+        convs = session["conversations"]
+        # make sure the first conversation in a session is from human prompt
+        while (len(convs) > 0 and convs[0]["from"] != "human"):
+            convs.pop(0)
         if len(convs) < 2:
             continue
-        min_prompt_len = len(tokenizer(convs[0]["value"]).input_ids)
-        min_output_len = len(tokenizer(convs[1]["value"]).input_ids)
-        if (not filter_dataset) or (min_prompt_len >= 4 and min_output_len >= 4):
+        assert(dataset[sid]["conversations"][0]["from"] == "human")
+        first_prompts.append(convs[0]["value"])
+        first_outputs.append(convs[1]["value"])
+        sids.append(sid)
+    # batching tokenizer to process all inputs is much faster
+    first_prompts_tks = tokenizer(first_prompts).input_ids
+    first_outputs_tks = tokenizer(first_outputs).input_ids
+
+    sessionMDs = []
+    for (sid, prompt_tks, output_tks) in zip(sids, first_prompts_tks, first_outputs_tks):
+        if (not filter_dataset) or len(prompt_tks) >= 4 and len(output_tks) >= 4:
             sessionMDs.append(SessionMD(sid))
     print(f"From the dataset, we consider total of {len(sessionMDs)} conversation sessions in the trace.")
     sampled_sessionMDs = random.sample(sessionMDs, num_requests)
@@ -86,30 +130,33 @@ def sample_requests(
     # sampled requests entry: (prompt, prompted_len, output_len)
     sampled_requests = []
 
-    request_stat = {"TotalSessions" : 0, "ConvsPerSession" : {}, "TotalPromptTokens" : 0, "TotalOutputTokens" : 0}
+    stat : RequestStat = RequestStat()
     while len(workqueue) > 0:
         sid, cid, acc_prompt_ntks = workqueue.pop(0)
         convs = dataset[sid]["conversations"]
+        prefix_prompt = ''.join([conv["value"] for conv in convs[:cid]])
         Qconv = convs[cid]
-        Aconv = convs[cid + 1]
-        assert(Qconv["from"] == "human" and Aconv["from"] == "gpt")
-        next_prompt = str.join([conv["value"] for conv in convs[:cid + 1]])
-        next_prompt_ntks = acc_prompt_ntks + len(tokenizer(Qconv["value"]).input_ids)
+        assert(Qconv["from"] == "human")
+        new_prompt = Qconv["value"]
+        cid += 1
+        while cid < len(convs) and (convs[cid]["from"] == "human"):
+            new_prompt += convs[cid]["value"]
+            cid += 1
+        if (cid == len(convs)): continue
+        Aconv = convs[cid]
+        assert(Aconv["from"] != "human")
+        next_prompt = prefix_prompt + new_prompt
+        next_prompt_ntks = acc_prompt_ntks + len(tokenizer(new_prompt).input_ids)
         next_completion_ntks = len(tokenizer(Aconv["value"]).input_ids)
         if filter_dataset and (next_prompt_ntks > 1024 or next_prompt_ntks + next_completion_ntks > 2048):
             continue
-        request_stat["TotalSessions"] += 1
-        request_stat["TotalPromptTokens"] += next_prompt_ntks
-        request_stat["TotalOutputTokens"] += next_completion_ntks
-        request_stat["ConvsPerSession"][sid] = request_stat["ConvsPerSession"].get(sid, 0) + 1
+        stat.TraceReq(sid, next_prompt_ntks, next_completion_ntks)
         sampled_requests.append((next_prompt, len(next_prompt), next_completion_ntks))
-        if cid + 2 < len(convs):
-            workqueue.append((sid, cid + 2, next_prompt_ntks + next_completion_ntks))
-    # show the min, max, avg of the sampled requests prompt_len, output_len and sum of both
-    stat_ops = [np.mean, np.min, np.max]
-    N = len(sampled_requests)
-    print(f"Sampled requests stats: {N} requests from {request_stat["TotalSessions"]} sessions, convs/session (min/max/avg): {'/'.join([str(op(request_stat["ConvsPerSession"].values())) for op in stat_ops])}")
-    print(f"avg prompt_tks ({request_stat["TotalPromptTokens"] / N}), avg output_tks ({request_stat["TotalOutputTokens"] / N})")
+        next_cid = cid + 1
+        if next_cid < len(convs):
+            workqueue.append((sid, next_cid, next_prompt_ntks + next_completion_ntks))
+    stat.AssertTotal(len(sampled_requests))
+    stat.Print()
     return sampled_requests
 
 
@@ -142,6 +189,7 @@ def run_vllm(
         enforce_eager=enforce_eager,
         kv_cache_dtype=kv_cache_dtype,
         device=device,
+        disable_log_stats=False,
     )
 
     # Add the requests to the engine.
