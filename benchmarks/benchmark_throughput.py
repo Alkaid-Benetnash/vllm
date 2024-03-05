@@ -302,6 +302,7 @@ def main(args: argparse.Namespace):
     if args.dataset is None:
         # Synthesize a prompt with the given input length.
         prompt = "hi" * (args.input_len - 1)
+        print(f"Using a synthesized prompt with {len(tokenizer(prompt).input_ids)} tokens (target is {args.input_len})")
         requests = [(prompt, args.input_len, args.output_len)
                     for _ in range(args.num_prompts)]
     else:
