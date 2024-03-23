@@ -175,6 +175,7 @@ def run_vllm(
     enforce_eager: bool,
     kv_cache_dtype: str,
     device: str,
+    **kwargs
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -189,7 +190,7 @@ def run_vllm(
         enforce_eager=enforce_eager,
         kv_cache_dtype=kv_cache_dtype,
         device=device,
-        disable_log_stats=False,
+        **kwargs
     )
 
     # Add the requests to the engine.
@@ -291,7 +292,6 @@ def run_mii(
     end = time.perf_counter()
     return end - start
 
-
 def main(args: argparse.Namespace):
     print(args)
     random.seed(args.seed)
@@ -315,7 +315,7 @@ def main(args: argparse.Namespace):
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
                                 args.max_model_len, args.enforce_eager,
-                                args.kv_cache_dtype, args.device)
+                                args.kv_cache_dtype, args.device, disable_log_stats=(not args.log_stats), max_num_seqs=args.max_num_seqs)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -367,6 +367,8 @@ if __name__ == "__main__":
                         type=int,
                         default=1000,
                         help="Number of prompts to process.")
+    parser.add_argument("--log-stats", action="store_true", help="Enable logging stats for vLLM backend.")
+    parser.add_argument("--max-num-seqs", type=int, default=256, help="Maximum number of sequences to process in a single batch.")
     parser.add_argument("--no-filter-dataset", dest="filter_dataset", action="store_false", help="Disable the vLLM default behavior of filtering out too short and too long sequences from the dataset.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--hf-max-batch-size",
