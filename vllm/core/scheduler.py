@@ -27,7 +27,11 @@ class PreemptionMode(enum.Enum):
     SWAP = enum.auto()
     RECOMPUTE = enum.auto()
 
-
+class RecomputeStats:
+    def __init__(self) -> None:
+        self.num_recomputed_seqs = 0
+        self.recompute_encode_tks = 0
+        self.recompute_decode_tks = 0
 class SchedulerOutputs:
 
     def __init__(
@@ -39,6 +43,7 @@ class SchedulerOutputs:
         blocks_to_swap_out: Dict[int, int],
         blocks_to_copy: Dict[int, List[int]],
         ignored_seq_groups: List[SequenceGroup],
+        recompute_stats : RecomputeStats,
     ) -> None:
         self.scheduled_seq_groups = scheduled_seq_groups
         self.prompt_run = prompt_run
@@ -53,6 +58,8 @@ class SchedulerOutputs:
         self.num_loras = len(self.lora_requests)
         if self.num_loras > 0:
             self._sort_by_lora_ids()
+
+        self.recompute_stats = recompute_stats
 
     def is_empty(self) -> bool:
         # NOTE: We do not consider the ignored sequence groups.
@@ -162,6 +169,7 @@ class Scheduler:
         blocks_to_swap_in: Dict[int, int] = {}
         blocks_to_swap_out: Dict[int, int] = {}
         blocks_to_copy: Dict[int, List[int]] = {}
+        recompute_stats = RecomputeStats()
 
         # Fix the current time.
         now = time.monotonic()
@@ -265,6 +273,7 @@ class Scheduler:
                     blocks_to_swap_out=blocks_to_swap_out,
                     blocks_to_copy=blocks_to_copy,
                     ignored_seq_groups=ignored_seq_groups,
+                    recompute_stats=recompute_stats,
                 )
                 return scheduler_outputs
 
@@ -283,12 +292,12 @@ class Scheduler:
                 if self.running:
                     # Preempt the lowest-priority sequence groups.
                     victim_seq_group = self.running.pop()
-                    self._preempt(victim_seq_group, blocks_to_swap_out)
+                    self._preempt(victim_seq_group, blocks_to_swap_out, recompute_stats)
                     preempted.append(victim_seq_group)
                 else:
                     # No other sequence groups can be preempted.
                     # Preempt the current sequence group.
-                    self._preempt(seq_group, blocks_to_swap_out)
+                    self._preempt(seq_group, blocks_to_swap_out, recompute_stats)
                     preempted.append(seq_group)
                     break
             else:
@@ -357,6 +366,7 @@ class Scheduler:
             blocks_to_swap_out=blocks_to_swap_out,
             blocks_to_copy=blocks_to_copy,
             ignored_seq_groups=[],
+            recompute_stats=recompute_stats,
         )
         return scheduler_outputs
 
@@ -425,6 +435,7 @@ class Scheduler:
         self,
         seq_group: SequenceGroup,
         blocks_to_swap_out: Dict[int, int],
+        recompute_stats : RecomputeStats,
         preemption_mode: Optional[PreemptionMode] = None,
     ) -> None:
         # If preemption mode is not specified, we determine the mode as follows:
@@ -444,7 +455,7 @@ class Scheduler:
             else:
                 preemption_mode = PreemptionMode.SWAP
         if preemption_mode == PreemptionMode.RECOMPUTE:
-            self._preempt_by_recompute(seq_group)
+            self._preempt_by_recompute(seq_group, recompute_stats)
         elif preemption_mode == PreemptionMode.SWAP:
             self._preempt_by_swap(seq_group, blocks_to_swap_out)
         else:
@@ -453,10 +464,21 @@ class Scheduler:
     def _preempt_by_recompute(
         self,
         seq_group: SequenceGroup,
+        recompute_stats : RecomputeStats
     ) -> None:
         seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
         assert len(seqs) == 1
+        recompute_stats.num_recomputed_seqs += 1
         for seq in seqs:
+            # update recompute_stats
+            block_table = self.block_manager.get_block_table(seq)
+            total_tks = len(block_table) * seq.block_size
+            if len(seq.logical_token_blocks) == len(block_table):
+                total_tks -= seq.logical_token_blocks[-1].get_num_empty_slots()
+            recompute_encode_tks = min(seq.get_prompt_len(), total_tks)
+            recompute_stats.recompute_encode_tks += recompute_encode_tks
+            recompute_stats.recompute_decode_tks += total_tks - recompute_encode_tks
+            # free
             seq.status = SequenceStatus.WAITING
             self.block_manager.free(seq)
         # NOTE: For FCFS, we insert the preempted sequence group to the front

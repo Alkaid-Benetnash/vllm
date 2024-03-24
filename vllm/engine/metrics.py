@@ -105,6 +105,9 @@ class Stats:
     num_running: int
     num_waiting: int
     num_swapped: int
+    num_recomputed: int
+    num_recomputed_encode : int
+    num_recomputed_decode : int
     gpu_cache_usage: float
     cpu_cache_usage: float
 
@@ -216,6 +219,7 @@ class StatLogger:
                 f"Running: {stats.num_running} reqs, "
                 f"Swapped: {stats.num_swapped} reqs, "
                 f"Pending: {stats.num_waiting} reqs, "
+                f"Recomp: {stats.num_recomputed} reqs {stats.num_recomputed_encode} enc {stats.num_recomputed_decode} dec, "
                 f"GPU KV cache usage: {stats.gpu_cache_usage * 100:.1f}%, "
                 f"CPU KV cache usage: {stats.cpu_cache_usage * 100:.1f}%")
 

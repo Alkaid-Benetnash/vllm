@@ -885,6 +885,9 @@ class LLMEngine:
         time_to_first_tokens = []
         time_per_output_tokens = []
         time_e2e_requests = []
+        num_recomputed = 0
+        num_recomputed_encode = 0
+        num_recomputed_decode = 0
         if scheduler_outputs is not None:
             prompt_run = scheduler_outputs.prompt_run
 
@@ -911,6 +914,9 @@ class LLMEngine:
 
             time_to_first_tokens = time_last_iters if prompt_run else []
             time_per_output_tokens = [] if prompt_run else time_last_iters
+            num_recomputed=scheduler_outputs.recompute_stats.num_recomputed_seqs
+            num_recomputed_encode=scheduler_outputs.recompute_stats.recompute_encode_tks
+            num_recomputed_decode=scheduler_outputs.recompute_stats.recompute_decode_tks
 
         return Stats(
             now=now,
@@ -924,6 +930,9 @@ class LLMEngine:
             time_to_first_tokens=time_to_first_tokens,
             time_per_output_tokens=time_per_output_tokens,
             time_e2e_requests=time_e2e_requests,
+            num_recomputed=num_recomputed,
+            num_recomputed_encode=num_recomputed_encode,
+            num_recomputed_decode=num_recomputed_decode,
         )
 
     def _decode_sequence(self, seq: Sequence, prms: SamplingParams) -> None:
