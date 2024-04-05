@@ -11,6 +11,7 @@ import torch
 from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           PreTrainedTokenizerBase)
 from tqdm import tqdm
+import os
 
 @dataclass
 class SessionMD:
@@ -175,6 +176,7 @@ def run_vllm(
     enforce_eager: bool,
     kv_cache_dtype: str,
     device: str,
+    do_profile: str,
     **kwargs
 ) -> float:
     from vllm import LLM, SamplingParams
@@ -210,10 +212,35 @@ def run_vllm(
             sampling_params=sampling_params,
         )
 
-    start = time.perf_counter()
     # FIXME(woosuk): Do not use internal method.
-    llm._run_engine(use_tqdm=True)
-    end = time.perf_counter()
+    if do_profile == "chrome":
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True, use_cuda=True) as prof:
+                    #on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    #    str(profile_dir))
+            start = time.perf_counter()
+            llm._run_engine(use_tqdm=True)
+            end = time.perf_counter()
+        logfile=os.environ.get("LOGFILE", "profiler_trace")
+        prof.export_chrome_trace(f"{logfile}.json")
+    elif do_profile == "tensorboard":
+        logfile=os.environ.get("LOGFILE", "profiler_trace")
+        profile_dir=f"/workspace/{logfile}.profile"
+        with torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ],
+                            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                                profile_dir)) as p:
+            start = time.perf_counter()
+            llm._run_engine(use_tqdm=True)
+            end = time.perf_counter()
+        print(p.key_averages())
+    else:
+        start = time.perf_counter()
+        llm._run_engine(use_tqdm=True)
+        end = time.perf_counter()
+
     return end - start
 
 
@@ -315,7 +342,8 @@ def main(args: argparse.Namespace):
                                 args.seed, args.n, args.use_beam_search,
                                 args.trust_remote_code, args.dtype,
                                 args.max_model_len, args.enforce_eager,
-                                args.kv_cache_dtype, args.device, disable_log_stats=(not args.log_stats), max_num_seqs=args.max_num_seqs)
+                                args.kv_cache_dtype, args.device, args.profile,
+                                disable_log_stats=(not args.log_stats), max_num_seqs=args.max_num_seqs)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -409,6 +437,8 @@ if __name__ == "__main__":
         default="cuda",
         choices=["cuda"],
         help='device type for vLLM execution, supporting CUDA only currently.')
+    parser.add_argument("--profile", type=str, default='none', choices=['none', 'chrome', 'tensorboard'],help="Choose torch profiling mode")
+
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
