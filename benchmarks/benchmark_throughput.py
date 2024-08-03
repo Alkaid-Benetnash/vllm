@@ -1,4 +1,5 @@
 """Benchmark offline inference throughput."""
+import os
 import argparse
 import json
 import random
@@ -11,6 +12,7 @@ from transformers import (AutoModelForCausalLM, AutoTokenizer,
                           PreTrainedTokenizerBase)
 
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
+from vllm.distributed import get_tensor_model_parallel_rank
 
 
 def sample_requests(
@@ -78,8 +80,10 @@ def run_vllm(
     enable_prefix_caching: bool,
     enable_chunked_prefill: bool,
     max_num_batched_tokens: int,
+    do_profile: str,
     gpu_memory_utilization: float = 0.9,
     download_dir: Optional[str] = None,
+    **kwargs,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -100,6 +104,7 @@ def run_vllm(
         download_dir=download_dir,
         enable_chunked_prefill=enable_chunked_prefill,
         max_num_batched_tokens=max_num_batched_tokens,
+        **kwargs,
     )
 
     # Add the requests to the engine.
@@ -119,11 +124,50 @@ def run_vllm(
             sampling_params=sampling_params,
         )
 
-    start = time.perf_counter()
     # FIXME(woosuk): Do not use internal method.
-    llm._run_engine(use_tqdm=True)
-    end = time.perf_counter()
-    return end - start
+    def _run_engine_with_timer() -> float:
+        start = time.perf_counter()
+        outputs = llm._run_engine(use_tqdm=True)
+        end = time.perf_counter()
+        assert(len(requests) == len(outputs))
+        for (_, _, output_len), output in zip(requests, outputs):
+            for beam in output.outputs:
+                assert (len(beam.token_ids) == output_len), f"req {output.request_id} output {beam.index}: decoded {len(beam.token_ids)} output tokens, {output_len} tokens expected"
+        return end - start
+
+    if do_profile == "chrome":
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA], record_shapes=True, use_cuda=True) as prof:
+            elapsed = _run_engine_with_timer()
+        logfile=os.environ.get("LOGFILE", "profiler_trace")
+        prof.export_chrome_trace(f"{logfile}.json")
+    elif do_profile == "tensorboard":
+        logfile=os.environ.get("LOGFILE", "profiler_trace")
+        profile_dir=f"/workspace/{logfile}.profile"
+        with torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ],
+                            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                                profile_dir)) as p:
+            elapsed = _run_engine_with_timer()
+        print(p.key_averages())
+    elif do_profile == "nvtx":
+        torch.cuda.cudart().cudaProfilerStart()
+
+        rank = get_tensor_model_parallel_rank()
+        print(f"Rank {rank} when running VLLM")
+        if rank == 0:
+            print("Running vLLM engine with in nvtx")
+            torch.cuda.nvtx.range_push("vllm_core")
+        elapsed = _run_engine_with_timer()
+        if rank == 0:
+            torch.cuda.nvtx.range_pop()
+
+        torch.cuda.cudart().cudaProfilerStop()
+    else:
+        elapsed = _run_engine_with_timer()
+    return elapsed
 
 
 def run_hf(
@@ -228,8 +272,11 @@ def main(args: argparse.Namespace):
             args.enforce_eager, args.kv_cache_dtype,
             args.quantization_param_path, args.device,
             args.enable_prefix_caching, args.enable_chunked_prefill,
-            args.max_num_batched_tokens, args.gpu_memory_utilization,
-            args.download_dir)
+            args.max_num_batched_tokens,
+            args.profile,
+            args.gpu_memory_utilization,
+            args.download_dir,
+            disable_log_stats=(not args.log_stats), max_num_seqs=args.max_num_seqs)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -356,6 +403,11 @@ if __name__ == "__main__":
                         default=None,
                         help='directory to download and load the weights, '
                         'default to the default cache dir of huggingface')
+
+    parser.add_argument("--log-stats", action="store_true", help="Enable logging stats for vLLM backend.")
+    parser.add_argument("--max-num-seqs", type=int, default=256, help="Maximum number of sequences to process in a single batch.")
+    parser.add_argument("--profile", type=str, default='none', choices=['none', 'chrome', 'tensorboard', 'nvtx'],help="Choose torch profiling mode")
+
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
