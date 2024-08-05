@@ -84,6 +84,7 @@ def run_vllm(
     gpu_memory_utilization: float = 0.9,
     download_dir: Optional[str] = None,
     load_format: str = EngineArgs.load_format,
+    **kwargs,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -106,6 +107,7 @@ def run_vllm(
         max_num_batched_tokens=max_num_batched_tokens,
         distributed_executor_backend=distributed_executor_backend,
         load_format=load_format,
+        **kwargs
     )
 
     # Add the requests to the engine.
@@ -124,7 +126,12 @@ def run_vllm(
             ))
 
     start = time.perf_counter()
-    llm.generate(prompts, sampling_params, use_tqdm=True)
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=True)
+    assert(len(requests) == len(outputs))
+    for (_, _, output_len), output in zip(requests, outputs):
+        for beam in output.outputs:
+            assert (len(beam.token_ids) == output_len), f"req {output.request_id} output {beam.index}: decoded {len(beam.token_ids)} output tokens, {output_len} tokens expected"
+
     end = time.perf_counter()
     return end - start
 
@@ -232,7 +239,8 @@ def main(args: argparse.Namespace):
             args.quantization_param_path, args.device,
             args.enable_prefix_caching, args.enable_chunked_prefill,
             args.max_num_batched_tokens, args.distributed_executor_backend,
-            args.gpu_memory_utilization, args.download_dir, args.load_format)
+            args.gpu_memory_utilization, args.download_dir, args.load_format,
+            disable_log_stats=(not args.log_stats), max_num_seqs=args.max_num_seqs)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -405,6 +413,9 @@ if __name__ == "__main__":
         'section for more information.\n'
         '* "bitsandbytes" will load the weights using bitsandbytes '
         'quantization.\n')
+    parser.add_argument("--log-stats", action="store_true", help="Enable logging stats for vLLM backend.")
+    parser.add_argument("--max-num-seqs", type=int, default=256, help="Maximum number of sequences to process in a single batch.")
+
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
